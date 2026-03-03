@@ -1,6 +1,11 @@
 # Build output
 bin/
 obj/
+publish/
+
+# Runtime media (never commit)
+media_groups/
+**/media_groups/
 
 # User-specific files
 *.user
