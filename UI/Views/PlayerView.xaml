@@ -3,6 +3,8 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:converters="clr-namespace:PortablePlayer.UI.Converters"
              Loaded="OnLoaded"
+             UseLayoutRounding="True"
+             SnapsToDevicePixels="True"
              Background="#101010">
   <UserControl.Resources>
     <converters:BoolToGridLengthConverter x:Key="BoolToGridLengthConverter" />
@@ -38,7 +40,9 @@
                  FontWeight="SemiBold" />
     </DockPanel>
 
-    <Grid Grid.Row="1">
+    <Grid Grid.Row="1"
+          UseLayoutRounding="True"
+          SnapsToDevicePixels="True">
       <Grid.ColumnDefinitions>
         <ColumnDefinition Width="*" />
         <ColumnDefinition Width="{Binding IsNavigationOpen, Converter={StaticResource BoolToGridLengthConverter}}" />
@@ -47,8 +51,18 @@
               CornerRadius="10"
               Background="#1D1D1D"
               BorderThickness="1"
-              BorderBrush="#2F2F2F">
-        <ContentControl Content="{Binding CurrentMediaView}" />
+              BorderBrush="#2F2F2F"
+              SnapsToDevicePixels="True">
+        <Grid Margin="1"
+              Background="#000000"
+              ClipToBounds="True"
+              UseLayoutRounding="True"
+              SnapsToDevicePixels="True">
+          <ContentControl Content="{Binding CurrentMediaView}"
+                          HorizontalAlignment="Stretch"
+                          VerticalAlignment="Stretch"
+                          SnapsToDevicePixels="True" />
+        </Grid>
       </Border>
 
       <Border Grid.Column="1"
