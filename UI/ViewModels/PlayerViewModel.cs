@@ -3,6 +3,7 @@ using System.Windows;
 using PortablePlayer.Application.Interfaces;
 using PortablePlayer.Core;
 using PortablePlayer.Domain.Models;
+using PortablePlayer.Infrastructure.Diagnostics;
 
 namespace PortablePlayer.UI.ViewModels;
 
@@ -31,13 +32,14 @@ public sealed class PlayerViewModel : ObservableObject, IDisposable
         _thumbnailService = thumbnailService;
         _settingsService = settingsService;
         _localizationService = localizationService;
+        AppLog.Info("PlayerVM", "Constructed.");
 
         NavigationGroups = [];
-        ToggleModeCommand = new AsyncRelayCommand(() => _playbackController.ToggleModeAsync(), () => _descriptor is not null);
-        NextCommand = new AsyncRelayCommand(() => _playbackController.NextAsync(), () => _playbackController.CanGoNext());
-        PreviousCommand = new AsyncRelayCommand(() => _playbackController.PreviousAsync(), () => _playbackController.CanGoPrevious());
-        NextGroupCommand = new AsyncRelayCommand(() => _playbackController.NextGroupAsync(), () => _playbackController.CanGoNextGroup());
-        PreviousGroupCommand = new AsyncRelayCommand(() => _playbackController.PreviousGroupAsync(), () => _playbackController.CanGoPreviousGroup());
+        ToggleModeCommand = new AsyncRelayCommand(ExecuteToggleModeAsync, () => _descriptor is not null);
+        NextCommand = new AsyncRelayCommand(ExecuteNextAsync, () => _playbackController.CanGoNext());
+        PreviousCommand = new AsyncRelayCommand(ExecutePreviousAsync, () => _playbackController.CanGoPrevious());
+        NextGroupCommand = new AsyncRelayCommand(ExecuteNextGroupAsync, () => _playbackController.CanGoNextGroup());
+        PreviousGroupCommand = new AsyncRelayCommand(ExecutePreviousGroupAsync, () => _playbackController.CanGoPreviousGroup());
         ToggleNavigationCommand = new RelayCommand(() => IsNavigationOpen = !IsNavigationOpen);
         JumpToItemCommand = new AsyncRelayCommand(async () =>
         {
@@ -180,15 +182,23 @@ public sealed class PlayerViewModel : ObservableObject, IDisposable
     {
         _descriptor = descriptor;
         GroupName = descriptor.Name;
+        AppLog.Info("PlayerVM", $"InitializeAsync. Group={descriptor.Name}, MediaType={descriptor.MediaType}, Items={playlist.Items.Count}");
         await _playbackController.LoadAsync(descriptor, playlist, cancellationToken).ConfigureAwait(true);
-        await _playbackController.StartAsync(cancellationToken).ConfigureAwait(true);
         BuildNavigationSkeleton();
         _ = LoadThumbnailsAsync(cancellationToken);
         UpdateStateFromController();
     }
 
+    public async Task StartPlaybackAsync(CancellationToken cancellationToken = default)
+    {
+        AppLog.Info("PlayerVM", "StartPlaybackAsync called.");
+        await _playbackController.StartAsync(cancellationToken).ConfigureAwait(true);
+        UpdateStateFromController();
+    }
+
     public async Task JumpToAsync(NavigationItemViewModel item)
     {
+        AppLog.Info("PlayerVM", $"JumpToAsync requested. TargetIndex={item.Index}, File={item.FileName}");
         await _playbackController.JumpToIndexAsync(item.Index).ConfigureAwait(true);
         UpdateStateFromController();
     }
@@ -275,7 +285,14 @@ public sealed class PlayerViewModel : ObservableObject, IDisposable
 
     private void OnControllerStateChanged(object? sender, EventArgs e)
     {
-        global::System.Windows.Application.Current.Dispatcher.Invoke(UpdateStateFromController);
+        var dispatcher = global::System.Windows.Application.Current.Dispatcher;
+        if (dispatcher.CheckAccess())
+        {
+            UpdateStateFromController();
+            return;
+        }
+
+        _ = dispatcher.InvokeAsync(UpdateStateFromController);
     }
 
     private void UpdateStateFromController()
@@ -283,7 +300,45 @@ public sealed class PlayerViewModel : ObservableObject, IDisposable
         CurrentMediaView = _playbackController.CurrentView;
         ModeIndicator = _playbackController.ModeIndicator;
         StatusText = _playbackController.Status.ToString();
+        AppLog.Info(
+            "PlayerVM",
+            $"StateChanged. Mode={_playbackController.Mode}, Status={_playbackController.Status}, Index={_playbackController.CurrentIndex}, Indicator={_playbackController.ModeIndicator}, CanNext={_playbackController.CanGoNext()}, CanPrev={_playbackController.CanGoPrevious()}, CanNextGroup={_playbackController.CanGoNextGroup()}, CanPrevGroup={_playbackController.CanGoPreviousGroup()}");
         NotifyCommands();
+    }
+
+    private async Task ExecuteToggleModeAsync()
+    {
+        AppLog.Info("PlayerVM", $"ToggleMode command. CurrentMode={_playbackController.Mode}");
+        await _playbackController.ToggleModeAsync().ConfigureAwait(true);
+        AppLog.Info("PlayerVM", $"ToggleMode completed. NewMode={_playbackController.Mode}");
+    }
+
+    private async Task ExecuteNextAsync()
+    {
+        AppLog.Info("PlayerVM", $"Next command. CurrentIndex={_playbackController.CurrentIndex}, CanNext={_playbackController.CanGoNext()}");
+        await _playbackController.NextAsync().ConfigureAwait(true);
+        AppLog.Info("PlayerVM", $"Next completed. CurrentIndex={_playbackController.CurrentIndex}");
+    }
+
+    private async Task ExecutePreviousAsync()
+    {
+        AppLog.Info("PlayerVM", $"Previous command. CurrentIndex={_playbackController.CurrentIndex}, CanPrev={_playbackController.CanGoPrevious()}");
+        await _playbackController.PreviousAsync().ConfigureAwait(true);
+        AppLog.Info("PlayerVM", $"Previous completed. CurrentIndex={_playbackController.CurrentIndex}");
+    }
+
+    private async Task ExecuteNextGroupAsync()
+    {
+        AppLog.Info("PlayerVM", $"NextGroup command. CurrentIndex={_playbackController.CurrentIndex}, CanNextGroup={_playbackController.CanGoNextGroup()}");
+        await _playbackController.NextGroupAsync().ConfigureAwait(true);
+        AppLog.Info("PlayerVM", $"NextGroup completed. CurrentIndex={_playbackController.CurrentIndex}");
+    }
+
+    private async Task ExecutePreviousGroupAsync()
+    {
+        AppLog.Info("PlayerVM", $"PreviousGroup command. CurrentIndex={_playbackController.CurrentIndex}, CanPrevGroup={_playbackController.CanGoPreviousGroup()}");
+        await _playbackController.PreviousGroupAsync().ConfigureAwait(true);
+        AppLog.Info("PlayerVM", $"PreviousGroup completed. CurrentIndex={_playbackController.CurrentIndex}");
     }
 
     private void NotifyCommands()
@@ -304,6 +359,7 @@ public sealed class PlayerViewModel : ObservableObject, IDisposable
         }
 
         _disposed = true;
+        AppLog.Info("PlayerVM", "Dispose called.");
         _playbackController.StateChanged -= OnControllerStateChanged;
         _playbackController.Dispose();
     }

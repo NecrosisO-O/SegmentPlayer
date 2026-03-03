@@ -3,6 +3,7 @@ using PortablePlayer.Application.Interfaces;
 using PortablePlayer.Core;
 using PortablePlayer.Domain.Enums;
 using PortablePlayer.Domain.Models;
+using PortablePlayer.Infrastructure.Diagnostics;
 using PortablePlayer.Infrastructure.Services;
 using PortablePlayer.UI.Views;
 
@@ -25,6 +26,7 @@ public sealed class MainWindowViewModel : ObservableObject
 
     public MainWindowViewModel()
     {
+        AppLog.Info("MainWindowVM", "Constructing view model.");
         _settingsService = new SettingsService();
         _playlistService = new PlaylistService();
         _playlistMergeService = new PlaylistMergeService();
@@ -60,6 +62,7 @@ public sealed class MainWindowViewModel : ObservableObject
     {
         try
         {
+            AppLog.Info("MainWindowVM", "InitializeAsync started.");
             await _settingsService.LoadAsync().ConfigureAwait(true);
             await _localizationService.InitializeAsync().ConfigureAwait(true);
             WindowTitle = _localizationService.Get("window.title");
@@ -67,9 +70,11 @@ public sealed class MainWindowViewModel : ObservableObject
             await Task.Delay(1000).ConfigureAwait(true);
             await _groupSelectionViewModel.LoadGroupsAsync().ConfigureAwait(true);
             CurrentPage = _groupSelectionViewModel;
+            AppLog.Info("MainWindowVM", "InitializeAsync finished. Group selection page displayed.");
         }
         catch (Exception ex)
         {
+            AppLog.Error("MainWindowVM", "InitializeAsync failed.", ex);
             MessageBox.Show(
                 ex.Message,
                 "Startup Error",
@@ -80,8 +85,10 @@ public sealed class MainWindowViewModel : ObservableObject
 
     private async Task OpenGroupAsync(GroupDescriptor descriptor)
     {
+        AppLog.Info("MainWindowVM", $"OpenGroup requested. Group={descriptor.Name}, Valid={descriptor.IsValid}, MediaType={descriptor.MediaType}, Playlist={descriptor.PlaylistPath}");
         if (!descriptor.IsValid)
         {
+            AppLog.Warn("MainWindowVM", $"OpenGroup blocked because group is invalid: {descriptor.Name}");
             MessageBox.Show(
                 string.Join(Environment.NewLine, descriptor.Issues.Select(issue => issue.Message)),
                 _localizationService.Get("msg.invalid.title"),
@@ -91,6 +98,7 @@ public sealed class MainWindowViewModel : ObservableObject
         }
 
         var playlist = await _playlistService.LoadAsync(descriptor.PlaylistPath).ConfigureAwait(true);
+        AppLog.Info("MainWindowVM", $"Playlist loaded. Group={descriptor.Name}, ItemCount={playlist.Items.Count}");
 
         _playerViewModel?.Dispose();
         var playbackController = new PlaybackController(new VideoPlaybackEngine(), new ImagePlaybackEngine());
@@ -102,10 +110,12 @@ public sealed class MainWindowViewModel : ObservableObject
         };
         await _playerViewModel.InitializeAsync(descriptor, playlist).ConfigureAwait(true);
         CurrentPage = _playerViewModel;
+        AppLog.Info("MainWindowVM", $"Player page displayed for group {descriptor.Name}.");
     }
 
     private async Task ReturnToGroupSelectionAsync()
     {
+        AppLog.Info("MainWindowVM", "Returning to group selection.");
         _playerViewModel?.Dispose();
         _playerViewModel = null;
         await _groupSelectionViewModel.LoadGroupsAsync().ConfigureAwait(true);
@@ -114,6 +124,7 @@ public sealed class MainWindowViewModel : ObservableObject
 
     private void OpenSettingsWindow()
     {
+        AppLog.Info("MainWindowVM", "Opening settings window.");
         var viewModel = new SettingsViewModel(_settingsService, _localizationService);
         var window = new SettingsWindow
         {
@@ -122,6 +133,7 @@ public sealed class MainWindowViewModel : ObservableObject
         };
 
         var saved = window.ShowDialog();
+        AppLog.Info("MainWindowVM", $"Settings window closed. Saved={saved}");
         if (saved == true && CurrentPage == _groupSelectionViewModel)
         {
             _ = _groupSelectionViewModel.LoadGroupsAsync();
@@ -130,8 +142,10 @@ public sealed class MainWindowViewModel : ObservableObject
 
     private async Task OpenEditorAsync(GroupDescriptor descriptor)
     {
+        AppLog.Info("MainWindowVM", $"Opening editor for group {descriptor.Name}.");
         if (!File.Exists(descriptor.PlaylistPath))
         {
+            AppLog.Warn("MainWindowVM", $"Editor open blocked. Missing playlist: {descriptor.PlaylistPath}");
             MessageBox.Show(
                 _localizationService.Get("msg.playlist.missing"),
                 _localizationService.Get("msg.error.title"),
@@ -148,6 +162,7 @@ public sealed class MainWindowViewModel : ObservableObject
             Owner = global::System.Windows.Application.Current.MainWindow,
         };
         var result = editorWindow.ShowDialog();
+        AppLog.Info("MainWindowVM", $"Editor closed for group {descriptor.Name}. Saved={result}");
         if (result == true)
         {
             if (_playerViewModel is not null && CurrentPage == _playerViewModel)
@@ -163,13 +178,16 @@ public sealed class MainWindowViewModel : ObservableObject
 
     private async Task RefreshCurrentGroupAsync(GroupDescriptor descriptor)
     {
+        AppLog.Info("MainWindowVM", $"Refresh requested for group {descriptor.Name}.");
         RefreshDiff diff;
         try
         {
             diff = await _groupScanner.BuildRefreshDiffAsync(descriptor).ConfigureAwait(true);
+            AppLog.Info("MainWindowVM", $"Refresh diff built. Added={diff.AddedFiles.Count}, Missing={diff.MissingFiles.Count}, Changed={diff.HasChanges}");
         }
         catch (Exception ex)
         {
+            AppLog.Error("MainWindowVM", "Refresh failed while building diff.", ex);
             MessageBox.Show(
                 ex.Message,
                 _localizationService.Get("msg.error.title"),
@@ -200,6 +218,7 @@ public sealed class MainWindowViewModel : ObservableObject
 
         if (answer != MessageBoxResult.Yes)
         {
+            AppLog.Info("MainWindowVM", "Refresh canceled by user.");
             return;
         }
 
@@ -218,6 +237,7 @@ public sealed class MainWindowViewModel : ObservableObject
 
         var merged = _playlistMergeService.MergeWithFilesystem(existing, mediaFiles, descriptor.MediaType);
         await _playlistService.SaveAsync(descriptor.PlaylistPath, merged).ConfigureAwait(true);
+        AppLog.Info("MainWindowVM", $"Playlist merged and saved for group {descriptor.Name}. NewItemCount={merged.Items.Count}");
         await OpenGroupAsync(descriptor).ConfigureAwait(true);
     }
 }

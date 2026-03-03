@@ -3,6 +3,7 @@ using System.Windows;
 using PortablePlayer.Application.Interfaces;
 using PortablePlayer.Domain.Enums;
 using PortablePlayer.Domain.Models;
+using PortablePlayer.Infrastructure.Diagnostics;
 
 namespace PortablePlayer.Infrastructure.Services;
 
@@ -28,6 +29,7 @@ public sealed class PlaybackController : IPlaybackController
     {
         _videoEngine = videoEngine;
         _imageEngine = imageEngine;
+        AppLog.Info("PlaybackController", "Constructed.");
 
         _videoEngine.PlaybackCompleted += OnPlaybackCompleted;
         _videoEngine.PlaybackFailed += OnPlaybackFailed;
@@ -87,6 +89,7 @@ public sealed class PlaybackController : IPlaybackController
         PlaylistDocument document,
         CancellationToken cancellationToken = default)
     {
+        AppLog.Info("PlaybackController", $"LoadAsync. Group={descriptor.Name}, MediaType={descriptor.MediaType}, Items={document.Items.Count}");
         _groupMediaType = descriptor.MediaType;
         _mode = PlaybackMode.Auto;
         _status = PlaybackStatus.Stopped;
@@ -105,6 +108,7 @@ public sealed class PlaybackController : IPlaybackController
                 Loops = item.Loops,
                 Missing = item.Missing || !File.Exists(fullPath),
             });
+            AppLog.Info("PlaybackController", $"Resolved item. Index={i}, File={item.File}, Loops={item.Loops}, Group={item.Group}, Missing={item.Missing || !File.Exists(fullPath)}");
         }
 
         BuildGroupSegments();
@@ -126,15 +130,18 @@ public sealed class PlaybackController : IPlaybackController
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            AppLog.Info("PlaybackController", "StartAsync called.");
             _status = PlaybackStatus.Playing;
             _currentIndex = FindPlayableForward(0);
             if (_currentIndex < 0)
             {
                 _status = PlaybackStatus.Completed;
+                AppLog.Warn("PlaybackController", "StartAsync found no playable item.");
                 NotifyStateChanged();
                 return;
             }
 
+            AppLog.Info("PlaybackController", $"StartAsync selected index {_currentIndex}.");
             await PlayCurrentAsync(resetProgress: true, cancellationToken).ConfigureAwait(false);
         }
         finally
@@ -148,6 +155,7 @@ public sealed class PlaybackController : IPlaybackController
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            AppLog.Info("PlaybackController", "StopAsync called.");
             _status = PlaybackStatus.Stopped;
             await _videoEngine.StopAsync(cancellationToken).ConfigureAwait(false);
             await _imageEngine.StopAsync(cancellationToken).ConfigureAwait(false);
@@ -164,7 +172,9 @@ public sealed class PlaybackController : IPlaybackController
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            var oldMode = _mode;
             _mode = _mode == PlaybackMode.Auto ? PlaybackMode.Manual : PlaybackMode.Auto;
+            AppLog.Info("PlaybackController", $"ToggleModeAsync. {oldMode} -> {_mode}, CurrentIndex={_currentIndex}");
             if (_currentIndex >= 0)
             {
                 await PlayCurrentAsync(resetProgress: true, cancellationToken).ConfigureAwait(false);
@@ -186,6 +196,7 @@ public sealed class PlaybackController : IPlaybackController
         try
         {
             var next = FindPlayableForward(_currentIndex + 1);
+            AppLog.Info("PlaybackController", $"NextAsync. CurrentIndex={_currentIndex}, NextIndex={next}");
             if (next < 0)
             {
                 return;
@@ -207,6 +218,7 @@ public sealed class PlaybackController : IPlaybackController
         try
         {
             var prev = FindPlayableBackward(_currentIndex - 1);
+            AppLog.Info("PlaybackController", $"PreviousAsync. CurrentIndex={_currentIndex}, PrevIndex={prev}");
             if (prev < 0)
             {
                 return;
@@ -229,6 +241,7 @@ public sealed class PlaybackController : IPlaybackController
         {
             var currentGroup = ResolveCurrentGroupSegmentIndex();
             var nextSegment = FindNextPlayableSegment(currentGroup + 1);
+            AppLog.Info("PlaybackController", $"NextGroupAsync. CurrentSegment={currentGroup}, NextSegment={nextSegment}");
             if (nextSegment < 0)
             {
                 return;
@@ -251,6 +264,7 @@ public sealed class PlaybackController : IPlaybackController
         {
             var currentGroup = ResolveCurrentGroupSegmentIndex();
             var prevSegment = FindPreviousPlayableSegment(currentGroup - 1);
+            AppLog.Info("PlaybackController", $"PreviousGroupAsync. CurrentSegment={currentGroup}, PrevSegment={prevSegment}");
             if (prevSegment < 0)
             {
                 return;
@@ -273,6 +287,7 @@ public sealed class PlaybackController : IPlaybackController
         {
             if (_items.Count == 0)
             {
+                AppLog.Warn("PlaybackController", "JumpToIndexAsync ignored because no items are loaded.");
                 return;
             }
 
@@ -281,10 +296,12 @@ public sealed class PlaybackController : IPlaybackController
             {
                 target = FindPlayableForward(target);
             }
+            AppLog.Info("PlaybackController", $"JumpToIndexAsync. Requested={index}, Resolved={target}");
 
             if (target < 0)
             {
                 _status = PlaybackStatus.Completed;
+                AppLog.Warn("PlaybackController", "JumpToIndexAsync found no playable target.");
                 NotifyStateChanged();
                 return;
             }
@@ -320,11 +337,13 @@ public sealed class PlaybackController : IPlaybackController
         if (_currentIndex < 0 || _currentIndex >= _items.Count)
         {
             _status = PlaybackStatus.Completed;
+            AppLog.Warn("PlaybackController", $"PlayCurrentAsync ended because index is out of range. Index={_currentIndex}");
             NotifyStateChanged();
             return;
         }
 
         var item = _items[_currentIndex];
+        AppLog.Info("PlaybackController", $"PlayCurrentAsync. Index={_currentIndex}, File={item.FileName}, Mode={_mode}, MediaType={_groupMediaType}, Loops={item.Loops}, Missing={item.Missing}, Reset={resetProgress}");
         if (!IsPlayable(item))
         {
             if (_mode == PlaybackMode.Auto)
@@ -333,16 +352,19 @@ public sealed class PlaybackController : IPlaybackController
                 if (next < 0)
                 {
                     _status = PlaybackStatus.Completed;
+                    AppLog.Warn("PlaybackController", $"PlayCurrentAsync auto-skip failed; no next playable item after {_currentIndex}.");
                     NotifyStateChanged();
                     return;
                 }
 
                 _currentIndex = next;
+                AppLog.Info("PlaybackController", $"PlayCurrentAsync auto-skip to index {_currentIndex}.");
                 await PlayCurrentAsync(resetProgress: true, cancellationToken).ConfigureAwait(false);
                 return;
             }
 
             _status = PlaybackStatus.Error;
+            AppLog.Warn("PlaybackController", "PlayCurrentAsync manual mode hit unplayable item.");
             NotifyStateChanged();
             return;
         }
@@ -389,6 +411,7 @@ public sealed class PlaybackController : IPlaybackController
 
         await activeEngine.PlayAsync(request, cancellationToken).ConfigureAwait(false);
         _status = PlaybackStatus.Playing;
+        AppLog.Info("PlaybackController", $"PlayCurrentAsync started engine play. Index={_currentIndex}, Duration={request.DurationSeconds}");
         NotifyStateChanged();
 
         _ = Task.Run(async () =>
@@ -410,10 +433,12 @@ public sealed class PlaybackController : IPlaybackController
             try
             {
                 await activeEngine.PreloadAsync(preloadRequest).ConfigureAwait(false);
+                AppLog.Info("PlaybackController", $"PreloadAsync requested for index {nextIndex} ({next.FileName}).");
             }
             catch
             {
                 // Preload failure should never break playback.
+                AppLog.Warn("PlaybackController", $"PreloadAsync failed for index {nextIndex}.");
             }
         });
     }
@@ -440,12 +465,21 @@ public sealed class PlaybackController : IPlaybackController
 
     private async void OnPlaybackCompleted(object? sender, EventArgs e)
     {
+        var senderType = sender == _videoEngine ? "VideoEngine" : sender == _imageEngine ? "ImageEngine" : "Unknown";
+        AppLog.Info("PlaybackController", $"OnPlaybackCompleted from {senderType}. CurrentIndex={_currentIndex}, Mode={_mode}, Status={_status}");
+        var lockHeld = false;
         try
         {
             await _gate.WaitAsync().ConfigureAwait(false);
+            lockHeld = true;
         }
         catch (ObjectDisposedException)
         {
+            return;
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error("PlaybackController", "OnPlaybackCompleted failed while waiting gate.", ex);
             return;
         }
 
@@ -459,11 +493,8 @@ public sealed class PlaybackController : IPlaybackController
             var item = _items[_currentIndex];
             if (_mode == PlaybackMode.Manual)
             {
-                if (_groupMediaType == MediaType.Video)
-                {
-                    await PlayCurrentAsync(resetProgress: false, CancellationToken.None).ConfigureAwait(false);
-                }
-
+                AppLog.Info("PlaybackController", $"Manual mode replay current index {_currentIndex}.");
+                await PlayCurrentAsync(resetProgress: false, CancellationToken.None).ConfigureAwait(false);
                 return;
             }
 
@@ -471,6 +502,7 @@ public sealed class PlaybackController : IPlaybackController
             {
                 if (item.Loops < 0)
                 {
+                    AppLog.Info("PlaybackController", $"Auto mode infinite video at index {_currentIndex}, replay current.");
                     await PlayCurrentAsync(resetProgress: false, CancellationToken.None).ConfigureAwait(false);
                     return;
                 }
@@ -478,6 +510,7 @@ public sealed class PlaybackController : IPlaybackController
                 if (_videoCurrentLoop < _videoTotalLoop)
                 {
                     _videoCurrentLoop++;
+                    AppLog.Info("PlaybackController", $"Auto mode video loop advanced. Index={_currentIndex}, Loop={_videoCurrentLoop}/{_videoTotalLoop}");
                     NotifyStateChanged();
                     await PlayCurrentAsync(resetProgress: false, CancellationToken.None).ConfigureAwait(false);
                     return;
@@ -487,17 +520,20 @@ public sealed class PlaybackController : IPlaybackController
                 if (next < 0)
                 {
                     _status = PlaybackStatus.Completed;
+                    AppLog.Info("PlaybackController", "Auto mode video reached end of playlist.");
                     NotifyStateChanged();
                     return;
                 }
 
                 _currentIndex = next;
+                AppLog.Info("PlaybackController", $"Auto mode moving to next video index {_currentIndex}.");
                 await PlayCurrentAsync(resetProgress: true, CancellationToken.None).ConfigureAwait(false);
                 return;
             }
 
             if (item.Loops < 0)
             {
+                AppLog.Info("PlaybackController", $"Auto mode infinite image at index {_currentIndex}, waiting for manual action.");
                 return;
             }
 
@@ -505,27 +541,44 @@ public sealed class PlaybackController : IPlaybackController
             if (imageNext < 0)
             {
                 _status = PlaybackStatus.Completed;
+                AppLog.Info("PlaybackController", "Auto mode image reached end of playlist.");
                 NotifyStateChanged();
                 return;
             }
 
             _currentIndex = imageNext;
+            AppLog.Info("PlaybackController", $"Auto mode moving to next image index {_currentIndex}.");
             await PlayCurrentAsync(resetProgress: true, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error("PlaybackController", "OnPlaybackCompleted processing failed.", ex);
         }
         finally
         {
-            _gate.Release();
+            if (lockHeld)
+            {
+                ReleaseGateSafe();
+            }
         }
     }
 
     private async void OnPlaybackFailed(object? sender, PlaybackEngineError e)
     {
+        AppLog.Warn("PlaybackController", $"OnPlaybackFailed received. Message={e.Message}");
+        var lockHeld = false;
         try
         {
             await _gate.WaitAsync().ConfigureAwait(false);
+            lockHeld = true;
         }
         catch (ObjectDisposedException)
         {
+            return;
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error("PlaybackController", "OnPlaybackFailed failed while waiting gate.", ex);
             return;
         }
 
@@ -537,17 +590,26 @@ public sealed class PlaybackController : IPlaybackController
                 if (next >= 0)
                 {
                     _currentIndex = next;
+                    AppLog.Info("PlaybackController", $"Auto mode failure recovery to index {_currentIndex}.");
                     await PlayCurrentAsync(resetProgress: true, CancellationToken.None).ConfigureAwait(false);
                     return;
                 }
             }
 
             _status = PlaybackStatus.Error;
+            AppLog.Warn("PlaybackController", "Playback entered Error state.");
             NotifyStateChanged();
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error("PlaybackController", "OnPlaybackFailed processing failed.", ex);
         }
         finally
         {
-            _gate.Release();
+            if (lockHeld)
+            {
+                ReleaseGateSafe();
+            }
         }
     }
 
@@ -559,6 +621,7 @@ public sealed class PlaybackController : IPlaybackController
         }
 
         _imageCurrentSecond = Math.Max(0, currentSecond);
+        AppLog.Info("PlaybackController", $"Image progress update. Index={_currentIndex}, Second={_imageCurrentSecond}/{_imageTotalSecond}");
         NotifyStateChanged();
     }
 
@@ -713,8 +776,25 @@ public sealed class PlaybackController : IPlaybackController
 
     private void NotifyStateChanged() => StateChanged?.Invoke(this, EventArgs.Empty);
 
+    private void ReleaseGateSafe()
+    {
+        try
+        {
+            _gate.Release();
+        }
+        catch (ObjectDisposedException)
+        {
+            AppLog.Warn("PlaybackController", "ReleaseGateSafe ignored ObjectDisposedException.");
+        }
+        catch (SemaphoreFullException)
+        {
+            AppLog.Warn("PlaybackController", "ReleaseGateSafe ignored SemaphoreFullException.");
+        }
+    }
+
     public void Dispose()
     {
+        AppLog.Info("PlaybackController", "Dispose called.");
         _videoEngine.PlaybackCompleted -= OnPlaybackCompleted;
         _videoEngine.PlaybackFailed -= OnPlaybackFailed;
         _imageEngine.PlaybackCompleted -= OnPlaybackCompleted;

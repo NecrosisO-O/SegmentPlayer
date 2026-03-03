@@ -3,23 +3,23 @@ using LibVLCSharp.Shared;
 using LibVLCSharp.WPF;
 using PortablePlayer.Application.Interfaces;
 using PortablePlayer.Domain.Models;
+using PortablePlayer.Infrastructure.Diagnostics;
 using PlayerMediaType = PortablePlayer.Domain.Enums.MediaType;
 
 namespace PortablePlayer.Infrastructure.Services;
 
 public sealed class VideoPlaybackEngine : IPlaybackEngine
 {
-    private readonly object _sync = new();
     private LibVLC? _libVlc;
     private MediaPlayer? _activePlayer;
     private MediaPlayer? _standbyPlayer;
     private Media? _activeMedia;
-    private Media? _standbyMedia;
-    private PlaybackRequest? _preloadedRequest;
+    private readonly List<Media> _retiredMedia = [];
 
     public VideoPlaybackEngine()
     {
         LibVLCSharp.Shared.Core.Initialize();
+        AppLog.Info("VideoEngine", "Constructed and LibVLC core initialized.");
         View = new VideoView
         {
             HorizontalAlignment = HorizontalAlignment.Stretch,
@@ -43,6 +43,7 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
     {
         if (_libVlc is not null)
         {
+            AppLog.Info("VideoEngine", "InitializeAsync skipped because engine is already initialized.");
             return Task.CompletedTask;
         }
 
@@ -55,44 +56,42 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
         };
         _activePlayer.EnableHardwareDecoding = true;
         WireActiveEvents(_activePlayer);
-        ((VideoView)View).MediaPlayer = _activePlayer;
+        AttachPlayerToView(_activePlayer);
+        AppLog.Info("VideoEngine", $"Initialized. ActivePlayer={_activePlayer.GetHashCode()}, StandbyPlayer={_standbyPlayer.GetHashCode()}");
         return Task.CompletedTask;
     }
 
     public Task PlayAsync(PlaybackRequest request, CancellationToken cancellationToken = default)
     {
         EnsureInitialized();
+        AppLog.Info("VideoEngine", $"PlayAsync requested. File={request.FullPath}");
         if (!File.Exists(request.FullPath))
         {
             PlaybackFailed?.Invoke(this, new PlaybackEngineError
             {
                 Message = $"Media file not found: {request.FullPath}",
             });
+            AppLog.Warn("VideoEngine", $"PlayAsync failed: file missing ({request.FullPath}).");
             return Task.CompletedTask;
         }
 
-        lock (_sync)
+        if (_activeMedia is not null)
         {
-            if (_preloadedRequest is not null &&
-                string.Equals(_preloadedRequest.FullPath, request.FullPath, StringComparison.OrdinalIgnoreCase))
-            {
-                PromotePreloadedInternal();
-                _activePlayer!.Time = 0;
-                _activePlayer.Play();
-                _preloadedRequest = null;
-                return Task.CompletedTask;
-            }
+            _retiredMedia.Add(_activeMedia);
         }
 
-        _activeMedia?.Dispose();
         _activeMedia = new Media(_libVlc!, new Uri(request.FullPath));
-        _activePlayer!.Stop();
-        if (!_activePlayer.Play(_activeMedia))
+        if (!_activePlayer!.Play(_activeMedia))
         {
             PlaybackFailed?.Invoke(this, new PlaybackEngineError
             {
                 Message = $"Unable to play video: {request.FullPath}",
             });
+            AppLog.Warn("VideoEngine", $"PlayAsync failed with active player {_activePlayer.GetHashCode()}.");
+        }
+        else
+        {
+            AppLog.Info("VideoEngine", $"PlayAsync started on active player {_activePlayer.GetHashCode()}.");
         }
 
         return Task.CompletedTask;
@@ -100,9 +99,10 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
 
     public Task StopAsync(CancellationToken cancellationToken = default)
     {
+        AppLog.Info("VideoEngine", "StopAsync requested.");
         if (_activePlayer is not null)
         {
-            _activePlayer.Stop();
+            SafeStopActivePlayer();
         }
 
         if (_standbyPlayer is not null)
@@ -110,78 +110,51 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
             _standbyPlayer.Stop();
         }
 
-        _preloadedRequest = null;
+        DisposeRetiredMedia();
+
         return Task.CompletedTask;
     }
 
-    public async Task PreloadAsync(PlaybackRequest request, CancellationToken cancellationToken = default)
+    public Task PreloadAsync(PlaybackRequest request, CancellationToken cancellationToken = default)
     {
         EnsureInitialized();
-        if (!File.Exists(request.FullPath))
-        {
-            return;
-        }
-
-        lock (_sync)
-        {
-            _preloadedRequest = request;
-        }
-
-        _standbyMedia?.Dispose();
-        _standbyMedia = new Media(_libVlc!, new Uri(request.FullPath));
-        _standbyPlayer!.Stop();
-        var ok = _standbyPlayer.Play(_standbyMedia);
-        if (!ok)
-        {
-            lock (_sync)
-            {
-                _preloadedRequest = null;
-            }
-
-            return;
-        }
-
-        try
-        {
-            await Task.Delay(130, cancellationToken).ConfigureAwait(false);
-            _standbyPlayer.Pause();
-            _standbyPlayer.Time = 0;
-        }
-        catch
-        {
-            lock (_sync)
-            {
-                _preloadedRequest = null;
-            }
-        }
+        // Stable mode: keep playback on a single player to avoid deadlocks/pop-up windows.
+        AppLog.Info("VideoEngine", $"PreloadAsync skipped (stable mode). File={request.FullPath}");
+        return Task.CompletedTask;
     }
 
     public Task PromotePreloadedAsync(CancellationToken cancellationToken = default)
     {
         EnsureInitialized();
-        lock (_sync)
-        {
-            PromotePreloadedInternal();
-            _preloadedRequest = null;
-        }
-
-        _activePlayer!.Play();
+        AppLog.Info("VideoEngine", "PromotePreloadedAsync skipped (stable mode).");
         return Task.CompletedTask;
     }
 
-    private void PromotePreloadedInternal()
+    private void AttachPlayerToView(MediaPlayer player)
     {
-        if (_activePlayer is null || _standbyPlayer is null)
+        var hash = player.GetHashCode();
+        if (View.Dispatcher.CheckAccess())
+        {
+            ((VideoView)View).MediaPlayer = player;
+            AppLog.Info("VideoEngine", $"AttachPlayerToView (UI thread). Player={hash}");
+            return;
+        }
+
+        View.Dispatcher.Invoke(() => ((VideoView)View).MediaPlayer = player);
+        AppLog.Info("VideoEngine", $"AttachPlayerToView (dispatcher invoke). Player={hash}");
+    }
+
+    private void SafeStopActivePlayer()
+    {
+        if (_activePlayer is null)
         {
             return;
         }
 
-        _activePlayer.Stop();
         UnwireActiveEvents(_activePlayer);
-        (_activePlayer, _standbyPlayer) = (_standbyPlayer, _activePlayer);
-        (_activeMedia, _standbyMedia) = (_standbyMedia, _activeMedia);
+        _activePlayer.Stop();
         WireActiveEvents(_activePlayer);
-        ((VideoView)View).MediaPlayer = _activePlayer;
+        AppLog.Info("VideoEngine", $"SafeStopActivePlayer executed on player {_activePlayer.GetHashCode()}.");
     }
 
     private void EnsureInitialized()
@@ -206,11 +179,23 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
 
     private void OnEndReached(object? sender, EventArgs e)
     {
-        PlaybackCompleted?.Invoke(this, EventArgs.Empty);
+        AppLog.Info("VideoEngine", $"EndReached event from player {(sender as MediaPlayer)?.GetHashCode() ?? 0}.");
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                PlaybackCompleted?.Invoke(this, EventArgs.Empty);
+            }
+            catch (Exception ex)
+            {
+                AppLog.Error("VideoEngine", "PlaybackCompleted callback threw an exception.", ex);
+            }
+        });
     }
 
     private void OnEncounteredError(object? sender, EventArgs e)
     {
+        AppLog.Warn("VideoEngine", $"EncounteredError from player {(sender as MediaPlayer)?.GetHashCode() ?? 0}.");
         PlaybackFailed?.Invoke(this, new PlaybackEngineError
         {
             Message = "Video engine encountered an error.",
@@ -219,6 +204,7 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
 
     public void Dispose()
     {
+        AppLog.Info("VideoEngine", "Dispose called.");
         if (_activePlayer is not null)
         {
             UnwireActiveEvents(_activePlayer);
@@ -227,7 +213,29 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
 
         _standbyPlayer?.Dispose();
         _activeMedia?.Dispose();
-        _standbyMedia?.Dispose();
+        DisposeRetiredMedia();
         _libVlc?.Dispose();
+    }
+
+    private void DisposeRetiredMedia()
+    {
+        if (_retiredMedia.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var media in _retiredMedia)
+        {
+            try
+            {
+                media.Dispose();
+            }
+            catch (Exception ex)
+            {
+                AppLog.Warn("VideoEngine", $"DisposeRetiredMedia ignored dispose failure: {ex.Message}");
+            }
+        }
+
+        _retiredMedia.Clear();
     }
 }
