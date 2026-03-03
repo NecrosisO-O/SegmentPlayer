@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "uiLanguage": "zh-CN",
+  "groupsRoot": "media_groups",
+  "thumbnailFrameIndex": 30,
+  "thumbnailCacheEnabled": true,
+  "thumbnailCacheDir": "cache/thumbnails"
+}

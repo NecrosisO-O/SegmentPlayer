@@ -1,0 +1,310 @@
+using System.Collections.ObjectModel;
+using System.Windows;
+using PortablePlayer.Application.Interfaces;
+using PortablePlayer.Core;
+using PortablePlayer.Domain.Models;
+
+namespace PortablePlayer.UI.ViewModels;
+
+public sealed class PlayerViewModel : ObservableObject, IDisposable
+{
+    private readonly IPlaybackController _playbackController;
+    private readonly IThumbnailService _thumbnailService;
+    private readonly ISettingsService _settingsService;
+    private readonly ILocalizationService _localizationService;
+    private GroupDescriptor? _descriptor;
+    private FrameworkElement? _currentMediaView;
+    private string _modeIndicator = "A";
+    private bool _isNavigationOpen;
+    private string _groupName = string.Empty;
+    private string _statusText = string.Empty;
+    private NavigationItemViewModel? _selectedNavigationItem;
+    private bool _disposed;
+
+    public PlayerViewModel(
+        IPlaybackController playbackController,
+        IThumbnailService thumbnailService,
+        ISettingsService settingsService,
+        ILocalizationService localizationService)
+    {
+        _playbackController = playbackController;
+        _thumbnailService = thumbnailService;
+        _settingsService = settingsService;
+        _localizationService = localizationService;
+
+        NavigationGroups = [];
+        ToggleModeCommand = new AsyncRelayCommand(() => _playbackController.ToggleModeAsync(), () => _descriptor is not null);
+        NextCommand = new AsyncRelayCommand(() => _playbackController.NextAsync(), () => _playbackController.CanGoNext());
+        PreviousCommand = new AsyncRelayCommand(() => _playbackController.PreviousAsync(), () => _playbackController.CanGoPrevious());
+        NextGroupCommand = new AsyncRelayCommand(() => _playbackController.NextGroupAsync(), () => _playbackController.CanGoNextGroup());
+        PreviousGroupCommand = new AsyncRelayCommand(() => _playbackController.PreviousGroupAsync(), () => _playbackController.CanGoPreviousGroup());
+        ToggleNavigationCommand = new RelayCommand(() => IsNavigationOpen = !IsNavigationOpen);
+        JumpToItemCommand = new AsyncRelayCommand(async () =>
+        {
+            if (SelectedNavigationItem is null)
+            {
+                return;
+            }
+
+            await JumpToAsync(SelectedNavigationItem).ConfigureAwait(true);
+        }, () => SelectedNavigationItem is not null);
+        BackCommand = new AsyncRelayCommand(async () =>
+        {
+            if (BackRequested is not null)
+            {
+                await BackRequested.Invoke();
+            }
+        });
+        RefreshCommand = new AsyncRelayCommand(async () =>
+        {
+            if (RefreshRequested is not null)
+            {
+                await RefreshRequested.Invoke();
+            }
+        });
+        EditCommand = new AsyncRelayCommand(async () =>
+        {
+            if (EditRequested is not null)
+            {
+                await EditRequested.Invoke();
+            }
+        });
+        _playbackController.StateChanged += OnControllerStateChanged;
+
+        RefreshText = _localizationService.Get("btn.refresh");
+        EditText = _localizationService.Get("btn.edit");
+        BackText = _localizationService.Get("btn.back");
+        PrevGroupText = _localizationService.Get("btn.prevGroup");
+        PrevText = _localizationService.Get("btn.prev");
+        NextText = _localizationService.Get("btn.next");
+        NextGroupText = _localizationService.Get("btn.nextGroup");
+        NavigationText = _localizationService.Get("btn.navigation");
+        ToggleModeText = _localizationService.Get("btn.toggleMode");
+        JumpText = _localizationService.Get("btn.jump");
+        GroupPrefix = _localizationService.Get("nav.groupPrefix");
+    }
+
+    public ObservableCollection<NavigationGroupViewModel> NavigationGroups { get; }
+
+    public FrameworkElement? CurrentMediaView
+    {
+        get => _currentMediaView;
+        private set => SetProperty(ref _currentMediaView, value);
+    }
+
+    public string ModeIndicator
+    {
+        get => _modeIndicator;
+        private set => SetProperty(ref _modeIndicator, value);
+    }
+
+    public bool IsNavigationOpen
+    {
+        get => _isNavigationOpen;
+        set => SetProperty(ref _isNavigationOpen, value);
+    }
+
+    public string GroupName
+    {
+        get => _groupName;
+        private set => SetProperty(ref _groupName, value);
+    }
+
+    public string StatusText
+    {
+        get => _statusText;
+        private set => SetProperty(ref _statusText, value);
+    }
+
+    public string RefreshText { get; }
+
+    public string EditText { get; }
+
+    public string BackText { get; }
+
+    public string PrevGroupText { get; }
+
+    public string PrevText { get; }
+
+    public string NextText { get; }
+
+    public string NextGroupText { get; }
+
+    public string NavigationText { get; }
+
+    public string ToggleModeText { get; }
+
+    public string JumpText { get; }
+
+    public string GroupPrefix { get; }
+
+    public NavigationItemViewModel? SelectedNavigationItem
+    {
+        get => _selectedNavigationItem;
+        set
+        {
+            if (SetProperty(ref _selectedNavigationItem, value))
+            {
+                JumpToItemCommand.NotifyCanExecuteChanged();
+            }
+        }
+    }
+
+    public AsyncRelayCommand ToggleModeCommand { get; }
+
+    public AsyncRelayCommand NextCommand { get; }
+
+    public AsyncRelayCommand PreviousCommand { get; }
+
+    public AsyncRelayCommand NextGroupCommand { get; }
+
+    public AsyncRelayCommand PreviousGroupCommand { get; }
+
+    public RelayCommand ToggleNavigationCommand { get; }
+
+    public AsyncRelayCommand BackCommand { get; }
+
+    public AsyncRelayCommand RefreshCommand { get; }
+
+    public AsyncRelayCommand EditCommand { get; }
+
+    public AsyncRelayCommand JumpToItemCommand { get; }
+
+    public Func<Task>? BackRequested { get; set; }
+
+    public Func<Task>? RefreshRequested { get; set; }
+
+    public Func<Task>? EditRequested { get; set; }
+
+    public async Task InitializeAsync(GroupDescriptor descriptor, PlaylistDocument playlist, CancellationToken cancellationToken = default)
+    {
+        _descriptor = descriptor;
+        GroupName = descriptor.Name;
+        await _playbackController.LoadAsync(descriptor, playlist, cancellationToken).ConfigureAwait(true);
+        await _playbackController.StartAsync(cancellationToken).ConfigureAwait(true);
+        BuildNavigationSkeleton();
+        _ = LoadThumbnailsAsync(cancellationToken);
+        UpdateStateFromController();
+    }
+
+    public async Task JumpToAsync(NavigationItemViewModel item)
+    {
+        await _playbackController.JumpToIndexAsync(item.Index).ConfigureAwait(true);
+        UpdateStateFromController();
+    }
+
+    private async Task LoadThumbnailsAsync(CancellationToken cancellationToken)
+    {
+        if (_descriptor is null)
+        {
+            return;
+        }
+
+        var mediaType = _descriptor.MediaType;
+        var frame = _settingsService.Current.ThumbnailFrameIndex;
+        var cache = _settingsService.Current.ThumbnailCacheEnabled;
+
+        foreach (var navItem in NavigationGroups.SelectMany(group => group.Items))
+        {
+            if (navItem.IsMissing)
+            {
+                continue;
+            }
+
+            var fullPath = Path.Combine(_descriptor.FullPath, navItem.FileName);
+            var thumbnail = await _thumbnailService.GetThumbnailAsync(
+                fullPath,
+                mediaType,
+                frame,
+                cache,
+                cancellationToken).ConfigureAwait(true);
+            navItem.Thumbnail = thumbnail;
+        }
+    }
+
+    private void BuildNavigationSkeleton()
+    {
+        NavigationGroups.Clear();
+        var items = _playbackController.Items;
+        var cursor = 0;
+        var displayGroup = 1;
+        while (cursor < items.Count)
+        {
+            var group = new NavigationGroupViewModel
+            {
+                Header = $"{GroupPrefix} {displayGroup}",
+            };
+
+            var currentGroup = items[cursor].Group;
+            if (currentGroup is null)
+            {
+                group.Items.Add(ToNavigationItem(items[cursor]));
+                cursor++;
+            }
+            else
+            {
+                var end = cursor;
+                while (end + 1 < items.Count && items[end + 1].Group == currentGroup)
+                {
+                    end++;
+                }
+
+                for (var i = cursor; i <= end; i++)
+                {
+                    group.Items.Add(ToNavigationItem(items[i]));
+                }
+
+                cursor = end + 1;
+            }
+
+            NavigationGroups.Add(group);
+            displayGroup++;
+        }
+    }
+
+    private static NavigationItemViewModel ToNavigationItem(ResolvedPlaylistItem item)
+    {
+        return new NavigationItemViewModel
+        {
+            Index = item.Index,
+            FileName = item.FileName,
+            IsMissing = item.Missing,
+            Loops = item.Loops,
+        };
+    }
+
+    private void OnControllerStateChanged(object? sender, EventArgs e)
+    {
+        global::System.Windows.Application.Current.Dispatcher.Invoke(UpdateStateFromController);
+    }
+
+    private void UpdateStateFromController()
+    {
+        CurrentMediaView = _playbackController.CurrentView;
+        ModeIndicator = _playbackController.ModeIndicator;
+        StatusText = _playbackController.Status.ToString();
+        NotifyCommands();
+    }
+
+    private void NotifyCommands()
+    {
+        ToggleModeCommand.NotifyCanExecuteChanged();
+        NextCommand.NotifyCanExecuteChanged();
+        PreviousCommand.NotifyCanExecuteChanged();
+        NextGroupCommand.NotifyCanExecuteChanged();
+        PreviousGroupCommand.NotifyCanExecuteChanged();
+        JumpToItemCommand.NotifyCanExecuteChanged();
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        _playbackController.StateChanged -= OnControllerStateChanged;
+        _playbackController.Dispose();
+    }
+}

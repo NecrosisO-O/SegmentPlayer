@@ -1,0 +1,22 @@
+# Build output
+bin/
+obj/
+
+# User-specific files
+*.user
+*.rsuser
+*.suo
+
+# IDE and cache
+.vs/
+*.cache
+*.log
+*.binlog
+
+# Rider / ReSharper
+.idea/
+_ReSharper*/
+
+# OS files
+Thumbs.db
+Desktop.ini

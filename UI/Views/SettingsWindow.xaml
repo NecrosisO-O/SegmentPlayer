@@ -1,0 +1,70 @@
+<Window x:Class="PortablePlayer.UI.Views.SettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="{Binding WindowTitle}"
+        Width="520"
+        Height="420"
+        WindowStartupLocation="CenterOwner"
+        ResizeMode="NoResize"
+        Background="#1A1A1A">
+  <Grid Margin="20">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="*" />
+      <RowDefinition Height="Auto" />
+    </Grid.RowDefinitions>
+    <StackPanel>
+      <TextBlock Text="{Binding LanguageLabel}"
+                 Foreground="White"
+                 Margin="0,0,0,6" />
+      <ComboBox SelectedValue="{Binding UiLanguage}"
+                SelectedValuePath="Tag"
+                Margin="0,0,0,14">
+        <ComboBoxItem Content="Chinese (Simplified)"
+                      Tag="zh-CN" />
+        <ComboBoxItem Content="English"
+                      Tag="en-US" />
+      </ComboBox>
+
+      <TextBlock Text="{Binding GroupsRootLabel}"
+                 Foreground="White"
+                 Margin="0,0,0,6" />
+      <TextBox Text="{Binding GroupsRoot}"
+               Margin="0,0,0,14" />
+
+      <TextBlock Text="{Binding ThumbnailFrameLabel}"
+                 Foreground="White"
+                 Margin="0,0,0,6" />
+      <TextBox Text="{Binding ThumbnailFrameIndex}"
+               Margin="0,0,0,14" />
+
+      <CheckBox Content="{Binding CacheEnabledLabel}"
+                IsChecked="{Binding ThumbnailCacheEnabled}"
+                Foreground="White"
+                Margin="0,0,0,14" />
+
+      <TextBlock Text="{Binding CacheDirLabel}"
+                 Foreground="White"
+                 Margin="0,0,0,6" />
+      <TextBox Text="{Binding ThumbnailCacheDir}" />
+    </StackPanel>
+
+    <DockPanel Grid.Row="1"
+               Margin="0,16,0,0">
+      <TextBlock Text="{Binding StatusText}"
+                 Foreground="#90EE90"
+                 VerticalAlignment="Center"
+                 DockPanel.Dock="Left" />
+      <StackPanel Orientation="Horizontal"
+                  DockPanel.Dock="Right"
+                  HorizontalAlignment="Right">
+        <Button Content="{Binding CancelText}"
+                Padding="14,7"
+                Margin="0,0,8,0"
+                Command="{Binding CancelCommand}" />
+        <Button Content="{Binding SaveText}"
+                Padding="14,7"
+                Command="{Binding SaveCommand}" />
+      </StackPanel>
+    </DockPanel>
+  </Grid>
+</Window>

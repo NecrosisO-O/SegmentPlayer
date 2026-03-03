@@ -1,0 +1,20 @@
+<UserControl x:Class="PortablePlayer.UI.Views.SplashView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Background="#111111">
+  <Grid>
+    <StackPanel HorizontalAlignment="Center"
+                VerticalAlignment="Center">
+      <TextBlock Text="{Binding Title}"
+                 Foreground="White"
+                 FontSize="48"
+                 FontWeight="Bold"
+                 HorizontalAlignment="Center" />
+      <TextBlock Margin="0,12,0,0"
+                 Text="{Binding Subtitle}"
+                 Foreground="#D0D0D0"
+                 FontSize="18"
+                 HorizontalAlignment="Center" />
+    </StackPanel>
+  </Grid>
+</UserControl>
