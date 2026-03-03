@@ -36,6 +36,11 @@ public sealed class ThumbnailService : IThumbnailService
             return await LoadBitmapAsync(mediaPath, cancellationToken).ConfigureAwait(false);
         }
 
+        if (string.Equals(Path.GetExtension(mediaPath), ".gif", StringComparison.OrdinalIgnoreCase))
+        {
+            return await LoadBitmapAsync(mediaPath, cancellationToken).ConfigureAwait(false);
+        }
+
         if (!LibVlcRuntime.EnsureInitialized())
         {
             AppLog.Warn("ThumbnailService", "Skip video thumbnail because LibVLC runtime is not initialized.");

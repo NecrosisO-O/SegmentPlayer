@@ -34,7 +34,7 @@ Windows portable media player built with `C# .NET 8 + WPF + LibVLCSharp`.
 
 ## Supported Media
 
-- Video: `.mp4`
+- Video: `.mp4`, `.gif`
 - Image: `.jpg`, `.jpeg`, `.png`, `.bmp`, `.webp`
 
 ## Development Prerequisites

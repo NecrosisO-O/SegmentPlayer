@@ -1,12 +1,17 @@
+using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
-using System.Collections.Concurrent;
+using System.Windows.Interop;
+using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using LibVLCSharp.Shared;
 using LibVLCSharp.WPF;
 using PortablePlayer.Application.Interfaces;
 using PortablePlayer.Domain.Models;
 using PortablePlayer.Infrastructure.Diagnostics;
 using PlayerMediaType = PortablePlayer.Domain.Enums.MediaType;
+using WpfImage = System.Windows.Controls.Image;
 
 namespace PortablePlayer.Infrastructure.Services;
 
@@ -19,6 +24,15 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
 
     private readonly Grid _hostView;
     private readonly VideoView _videoView;
+    private readonly WpfImage _gifView;
+    private readonly DispatcherTimer _gifTimer;
+    private readonly object _gifCacheSync = new();
+    private GifClip? _gifCachedClip;
+    private string? _gifCachedPath;
+    private GifClip? _activeGifClip;
+    private int _gifFrameIndex;
+    private bool _isGifPlayback;
+
     private LibVLC? _libVlc;
     private MediaPlayer? _activePlayer;
     private MediaPlayer? _standbyPlayer;
@@ -42,6 +56,16 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
             SnapsToDevicePixels = true,
         };
 
+        _gifView = new WpfImage
+        {
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+            Stretch = System.Windows.Media.Stretch.Fill,
+            Visibility = Visibility.Collapsed,
+            UseLayoutRounding = true,
+            SnapsToDevicePixels = true,
+        };
+
         _hostView = new Grid
         {
             HorizontalAlignment = HorizontalAlignment.Stretch,
@@ -52,7 +76,14 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
             SnapsToDevicePixels = true,
         };
         _hostView.Children.Add(_videoView);
+        _hostView.Children.Add(_gifView);
         _hostView.SizeChanged += OnHostViewSizeChanged;
+
+        _gifTimer = new DispatcherTimer(DispatcherPriority.Render)
+        {
+            Interval = TimeSpan.FromMilliseconds(100),
+        };
+        _gifTimer.Tick += OnGifTimerTick;
 
         View = _hostView;
     }
@@ -97,7 +128,7 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
         return Task.CompletedTask;
     }
 
-    public Task PlayAsync(PlaybackRequest request, CancellationToken cancellationToken = default)
+    public async Task PlayAsync(PlaybackRequest request, CancellationToken cancellationToken = default)
     {
         EnsureInitialized();
         AppLog.Info("VideoEngine", $"PlayAsync requested. File={request.FullPath}");
@@ -108,43 +139,23 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
                 Message = $"Media file not found: {request.FullPath}",
             });
             AppLog.Warn("VideoEngine", $"PlayAsync failed: file missing ({request.FullPath}).");
-            return Task.CompletedTask;
+            return;
         }
 
-        if (_activeMedia is not null)
+        if (IsGifPath(request.FullPath))
         {
-            _retiredMedia.Add(_activeMedia);
+            await PlayGifAsync(request.FullPath, cancellationToken).ConfigureAwait(false);
+            return;
         }
 
-        _activeMedia = new Media(_libVlc!, new Uri(request.FullPath));
-        if (_aspectCache.TryGetValue(request.FullPath, out var cachedAspect) &&
-            cachedAspect > 0.05 &&
-            double.IsFinite(cachedAspect))
-        {
-            _sourceAspectRatio = cachedAspect;
-            UpdateVideoViewBounds();
-        }
-        if (!_activePlayer!.Play(_activeMedia))
-        {
-            PlaybackFailed?.Invoke(this, new PlaybackEngineError
-            {
-                Message = $"Unable to play video: {request.FullPath}",
-            });
-            AppLog.Warn("VideoEngine", $"PlayAsync failed with active player {_activePlayer.GetHashCode()}.");
-        }
-        else
-        {
-            AppLog.Info("VideoEngine", $"PlayAsync started on active player {_activePlayer.GetHashCode()}.");
-            ApplyStableVideoLayout(_activePlayer);
-            StartAspectProbe(_activePlayer, request.FullPath);
-        }
-
-        return Task.CompletedTask;
+        PlayVideo(request.FullPath);
     }
 
     public Task StopAsync(CancellationToken cancellationToken = default)
     {
         AppLog.Info("VideoEngine", "StopAsync requested.");
+        StopGifPlayback();
+
         if (_activePlayer is not null)
         {
             SafeStopActivePlayer();
@@ -160,11 +171,27 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
         return Task.CompletedTask;
     }
 
-    public Task PreloadAsync(PlaybackRequest request, CancellationToken cancellationToken = default)
+    public async Task PreloadAsync(PlaybackRequest request, CancellationToken cancellationToken = default)
     {
         EnsureInitialized();
-        // Keep preload path side-effect free in stable mode.
-        return Task.CompletedTask;
+        if (!IsGifPath(request.FullPath) || !File.Exists(request.FullPath))
+        {
+            // Keep video preload path side-effect free in stable mode.
+            return;
+        }
+
+        try
+        {
+            _ = await GetOrLoadGifClipAsync(request.FullPath, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Ignore canceled preloads.
+        }
+        catch (Exception ex)
+        {
+            AppLog.Warn("VideoEngine", $"PreloadAsync GIF decode ignored failure: {ex.Message}");
+        }
     }
 
     public Task PromotePreloadedAsync(CancellationToken cancellationToken = default)
@@ -172,6 +199,221 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
         EnsureInitialized();
         AppLog.Info("VideoEngine", "PromotePreloadedAsync skipped (stable mode).");
         return Task.CompletedTask;
+    }
+
+    private async Task PlayGifAsync(string fullPath, CancellationToken cancellationToken)
+    {
+        StopGifPlayback();
+        if (_activePlayer is not null)
+        {
+            SafeStopActivePlayer();
+        }
+
+        if (_activeMedia is not null)
+        {
+            _retiredMedia.Add(_activeMedia);
+            _activeMedia = null;
+        }
+
+        GifClip clip;
+        try
+        {
+            clip = await GetOrLoadGifClipAsync(fullPath, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            PlaybackFailed?.Invoke(this, new PlaybackEngineError
+            {
+                Message = $"Unable to decode GIF: {fullPath}",
+                Exception = ex,
+            });
+            AppLog.Error("VideoEngine", $"PlayGifAsync failed for {fullPath}.", ex);
+            return;
+        }
+
+        _aspectCache[fullPath] = clip.AspectRatio;
+        _sourceAspectRatio = clip.AspectRatio;
+
+        await _hostView.Dispatcher.InvokeAsync(() =>
+        {
+            _isGifPlayback = true;
+            _activeGifClip = clip;
+            _gifFrameIndex = 0;
+
+            _videoView.Visibility = Visibility.Collapsed;
+            _gifView.Visibility = Visibility.Visible;
+            _gifView.Source = clip.Frames[0];
+            UpdateVideoViewBounds();
+
+            _gifTimer.Stop();
+            _gifTimer.Interval = TimeSpan.FromMilliseconds(clip.DelaysMs[0]);
+            _gifTimer.Start();
+        });
+
+        AppLog.Info("VideoEngine", $"PlayGifAsync started. File={Path.GetFileName(fullPath)}, Frames={clip.Frames.Count}, Aspect={clip.AspectRatio:F4}");
+    }
+
+    private void PlayVideo(string fullPath)
+    {
+        StopGifPlayback();
+        EnterVideoMode();
+
+        if (_activeMedia is not null)
+        {
+            _retiredMedia.Add(_activeMedia);
+        }
+
+        _activeMedia = new Media(_libVlc!, new Uri(fullPath));
+        if (_aspectCache.TryGetValue(fullPath, out var cachedAspect) &&
+            cachedAspect > 0.05 &&
+            double.IsFinite(cachedAspect))
+        {
+            _sourceAspectRatio = cachedAspect;
+            UpdateVideoViewBounds();
+        }
+
+        if (!_activePlayer!.Play(_activeMedia))
+        {
+            PlaybackFailed?.Invoke(this, new PlaybackEngineError
+            {
+                Message = $"Unable to play video: {fullPath}",
+            });
+            AppLog.Warn("VideoEngine", $"PlayAsync failed with active player {_activePlayer.GetHashCode()}.");
+            return;
+        }
+
+        AppLog.Info("VideoEngine", $"PlayAsync started on active player {_activePlayer.GetHashCode()}.");
+        ApplyStableVideoLayout(_activePlayer);
+        StartAspectProbe(_activePlayer, fullPath);
+    }
+
+    private async Task<GifClip> GetOrLoadGifClipAsync(string fullPath, CancellationToken cancellationToken)
+    {
+        lock (_gifCacheSync)
+        {
+            if (string.Equals(_gifCachedPath, fullPath, StringComparison.OrdinalIgnoreCase) &&
+                _gifCachedClip is not null)
+            {
+                return _gifCachedClip;
+            }
+        }
+
+        var decoded = await Task.Run(() => DecodeGifClip(fullPath), cancellationToken).ConfigureAwait(false);
+        lock (_gifCacheSync)
+        {
+            _gifCachedPath = fullPath;
+            _gifCachedClip = decoded;
+        }
+
+        return decoded;
+    }
+
+    private static GifClip DecodeGifClip(string fullPath)
+    {
+        using var gif = System.Drawing.Image.FromFile(fullPath);
+        if (gif.FrameDimensionsList.Length == 0)
+        {
+            throw new InvalidOperationException("GIF has no frame dimensions.");
+        }
+
+        var dimension = new System.Drawing.Imaging.FrameDimension(gif.FrameDimensionsList[0]);
+        var frameCount = gif.GetFrameCount(dimension);
+        if (frameCount <= 0)
+        {
+            throw new InvalidOperationException("GIF has no frames.");
+        }
+
+        var frames = new List<BitmapSource>(frameCount);
+        var delays = ReadGifDelayMs(gif, frameCount);
+        for (var i = 0; i < frameCount; i++)
+        {
+            gif.SelectActiveFrame(dimension, i);
+            using var frameBitmap = new System.Drawing.Bitmap(gif);
+            frames.Add(ToBitmapSource(frameBitmap));
+        }
+
+        var width = Math.Max(1, gif.Width);
+        var height = Math.Max(1, gif.Height);
+        var aspect = (double)width / height;
+        if (!double.IsFinite(aspect) || aspect <= 0.05)
+        {
+            aspect = 16d / 9d;
+        }
+
+        return new GifClip(frames, delays, aspect);
+    }
+
+    private static List<int> ReadGifDelayMs(System.Drawing.Image gif, int frameCount)
+    {
+        const int defaultDelayMs = 100;
+        const int delayPropertyId = 0x5100;
+        var delays = new List<int>(frameCount);
+        try
+        {
+            var property = gif.GetPropertyItem(delayPropertyId);
+            if (property?.Value is null || property.Value.Length == 0)
+            {
+                for (var i = 0; i < frameCount; i++)
+                {
+                    delays.Add(defaultDelayMs);
+                }
+
+                return delays;
+            }
+
+            var bytes = property.Value;
+            for (var i = 0; i < frameCount; i++)
+            {
+                var offset = i * 4;
+                if (offset + 4 > bytes.Length)
+                {
+                    delays.Add(defaultDelayMs);
+                    continue;
+                }
+
+                var delayCentiseconds = BitConverter.ToInt32(bytes, offset);
+                if (delayCentiseconds <= 0)
+                {
+                    delays.Add(defaultDelayMs);
+                    continue;
+                }
+
+                delays.Add(Math.Max(20, delayCentiseconds * 10));
+            }
+        }
+        catch
+        {
+            for (var i = 0; i < frameCount; i++)
+            {
+                delays.Add(defaultDelayMs);
+            }
+        }
+
+        while (delays.Count < frameCount)
+        {
+            delays.Add(defaultDelayMs);
+        }
+
+        return delays;
+    }
+
+    private static BitmapSource ToBitmapSource(System.Drawing.Bitmap bitmap)
+    {
+        var hBitmap = bitmap.GetHbitmap();
+        try
+        {
+            var source = Imaging.CreateBitmapSourceFromHBitmap(
+                hBitmap,
+                IntPtr.Zero,
+                Int32Rect.Empty,
+                BitmapSizeOptions.FromEmptyOptions());
+            source.Freeze();
+            return source;
+        }
+        finally
+        {
+            _ = DeleteObject(hBitmap);
+        }
     }
 
     private void AttachPlayerToView(MediaPlayer player)
@@ -196,10 +438,32 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
     private void OnHostViewSizeChanged(object sender, SizeChangedEventArgs e)
     {
         UpdateVideoViewBounds();
-        if (_activePlayer is not null)
+        if (!_isGifPlayback && _activePlayer is not null)
         {
             ApplyStableVideoLayout(_activePlayer);
         }
+    }
+
+    private void OnGifTimerTick(object? sender, EventArgs e)
+    {
+        if (_activeGifClip is null || _activeGifClip.Frames.Count == 0)
+        {
+            _gifTimer.Stop();
+            return;
+        }
+
+        var next = _gifFrameIndex + 1;
+        if (next >= _activeGifClip.Frames.Count)
+        {
+            _gifTimer.Stop();
+            _gifFrameIndex = 0;
+            RaisePlaybackCompletedAsync();
+            return;
+        }
+
+        _gifFrameIndex = next;
+        _gifView.Source = _activeGifClip.Frames[_gifFrameIndex];
+        _gifTimer.Interval = TimeSpan.FromMilliseconds(_activeGifClip.DelaysMs[_gifFrameIndex]);
     }
 
     private void StartAspectProbe(MediaPlayer player, string mediaPath)
@@ -209,7 +473,7 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
         {
             for (var i = 0; i < 30; i++)
             {
-                if (probeVersion != _aspectProbeVersion)
+                if (probeVersion != _aspectProbeVersion || _isGifPlayback)
                 {
                     return;
                 }
@@ -264,6 +528,38 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
         return double.IsFinite(aspect) && aspect > 0.05;
     }
 
+    private void EnterVideoMode()
+    {
+        if (!_hostView.Dispatcher.CheckAccess())
+        {
+            _hostView.Dispatcher.Invoke(EnterVideoMode);
+            return;
+        }
+
+        _videoView.Visibility = Visibility.Visible;
+        _gifView.Visibility = Visibility.Collapsed;
+        _gifView.Source = null;
+        _activeGifClip = null;
+        _gifFrameIndex = 0;
+        _isGifPlayback = false;
+    }
+
+    private void StopGifPlayback()
+    {
+        if (!_hostView.Dispatcher.CheckAccess())
+        {
+            _hostView.Dispatcher.Invoke(StopGifPlayback);
+            return;
+        }
+
+        _gifTimer.Stop();
+        _gifFrameIndex = 0;
+        _activeGifClip = null;
+        _gifView.Source = null;
+        _gifView.Visibility = Visibility.Collapsed;
+        _isGifPlayback = false;
+    }
+
     private void UpdateVideoViewBounds()
     {
         if (!_hostView.Dispatcher.CheckAccess())
@@ -278,6 +574,8 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
         {
             _videoView.Width = double.NaN;
             _videoView.Height = double.NaN;
+            _gifView.Width = double.NaN;
+            _gifView.Height = double.NaN;
             return;
         }
 
@@ -301,8 +599,12 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
             targetHeight = targetWidth / sourceAspect;
         }
 
-        _videoView.Width = Math.Max(1, Math.Round(targetWidth));
-        _videoView.Height = Math.Max(1, Math.Round(targetHeight));
+        var width = Math.Max(1, Math.Round(targetWidth));
+        var height = Math.Max(1, Math.Round(targetHeight));
+        _videoView.Width = width;
+        _videoView.Height = height;
+        _gifView.Width = width;
+        _gifView.Height = height;
     }
 
     private static void ApplyStableVideoLayout(MediaPlayer player)
@@ -354,6 +656,11 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
     private void OnEndReached(object? sender, EventArgs e)
     {
         AppLog.Info("VideoEngine", $"EndReached event from player {(sender as MediaPlayer)?.GetHashCode() ?? 0}.");
+        RaisePlaybackCompletedAsync();
+    }
+
+    private void RaisePlaybackCompletedAsync()
+    {
         _ = Task.Run(() =>
         {
             try
@@ -376,11 +683,21 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
         });
     }
 
+    private static bool IsGifPath(string path) =>
+        string.Equals(Path.GetExtension(path), ".gif", StringComparison.OrdinalIgnoreCase);
+
+    [DllImport("gdi32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DeleteObject(IntPtr hObject);
+
     public void Dispose()
     {
         AppLog.Info("VideoEngine", "Dispose called.");
         _hostView.SizeChanged -= OnHostViewSizeChanged;
+        _gifTimer.Stop();
+        _gifTimer.Tick -= OnGifTimerTick;
         _videoView.MediaPlayer = null;
+        _gifView.Source = null;
 
         if (_activePlayer is not null)
         {
@@ -414,5 +731,21 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
         }
 
         _retiredMedia.Clear();
+    }
+
+    private sealed class GifClip
+    {
+        public GifClip(IReadOnlyList<BitmapSource> frames, IReadOnlyList<int> delaysMs, double aspectRatio)
+        {
+            Frames = frames;
+            DelaysMs = delaysMs;
+            AspectRatio = aspectRatio;
+        }
+
+        public IReadOnlyList<BitmapSource> Frames { get; }
+
+        public IReadOnlyList<int> DelaysMs { get; }
+
+        public double AspectRatio { get; }
     }
 }
