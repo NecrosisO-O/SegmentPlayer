@@ -35,7 +35,12 @@ public sealed class MainWindowViewModel : ObservableObject
         _thumbnailService = new ThumbnailService(_settingsService);
 
         _splashViewModel = new SplashViewModel();
-        _groupSelectionViewModel = new GroupSelectionViewModel(_groupScanner, _localizationService)
+        _groupSelectionViewModel = new GroupSelectionViewModel(
+            _groupScanner,
+            _playlistService,
+            _thumbnailService,
+            _settingsService,
+            _localizationService)
         {
             PlayRequested = OpenGroupAsync,
             EditRequested = OpenEditorAsync,
