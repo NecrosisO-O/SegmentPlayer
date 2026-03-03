@@ -18,8 +18,8 @@ public sealed class VideoPlaybackEngine : IPlaybackEngine
 
     public VideoPlaybackEngine()
     {
-        LibVLCSharp.Shared.Core.Initialize();
-        AppLog.Info("VideoEngine", "Constructed and LibVLC core initialized.");
+        var initialized = LibVlcRuntime.EnsureInitialized();
+        AppLog.Info("VideoEngine", $"Constructed. LibVlcInitialized={initialized}");
         View = new VideoView
         {
             HorizontalAlignment = HorizontalAlignment.Stretch,

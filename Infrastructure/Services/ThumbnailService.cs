@@ -1,8 +1,10 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Windows.Interop;
 using System.Windows.Media.Imaging;
 using LibVLCSharp.Shared;
 using PortablePlayer.Application.Interfaces;
+using PortablePlayer.Infrastructure.Diagnostics;
 using PlayerMediaType = PortablePlayer.Domain.Enums.MediaType;
 
 namespace PortablePlayer.Infrastructure.Services;
@@ -11,11 +13,6 @@ public sealed class ThumbnailService : IThumbnailService
 {
     private readonly ISettingsService _settingsService;
     private readonly SemaphoreSlim _videoExtractLock = new(1, 1);
-
-    static ThumbnailService()
-    {
-        LibVLCSharp.Shared.Core.Initialize();
-    }
 
     public ThumbnailService(ISettingsService settingsService)
     {
@@ -37,6 +34,12 @@ public sealed class ThumbnailService : IThumbnailService
         if (mediaType == PlayerMediaType.Image)
         {
             return await LoadBitmapAsync(mediaPath, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (!LibVlcRuntime.EnsureInitialized())
+        {
+            AppLog.Warn("ThumbnailService", "Skip video thumbnail because LibVLC runtime is not initialized.");
+            return null;
         }
 
         var cacheFile = BuildCachePath(mediaPath, frameIndex);
@@ -114,84 +117,123 @@ public sealed class ThumbnailService : IThumbnailService
         string outputPath,
         CancellationToken cancellationToken)
     {
-        return await Task.Run(async () =>
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
         {
             try
             {
-                if (File.Exists(outputPath))
-                {
-                    File.Delete(outputPath);
-                }
-
-                using var libVlc = new LibVLC();
-                using var media = new Media(libVlc, new Uri(mediaPath));
-                await media.Parse(MediaParseOptions.ParseLocal).ConfigureAwait(false);
-                using var player = new MediaPlayer(libVlc);
-                player.Media = media;
-                player.Mute = true;
-
-                var started = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-                void HandlePlaying(object? sender, EventArgs args) => started.TrySetResult(true);
-                void HandleFailed(object? sender, EventArgs args) => started.TrySetResult(false);
-
-                player.Playing += HandlePlaying;
-                player.EncounteredError += HandleFailed;
-
-                try
-                {
-                    if (!player.Play())
-                    {
-                        return false;
-                    }
-
-                    using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                    linked.CancelAfter(TimeSpan.FromSeconds(6));
-                    var ok = await started.Task.WaitAsync(linked.Token).ConfigureAwait(false);
-                    if (!ok)
-                    {
-                        return false;
-                    }
-
-                    var targetMs = frameIndex * (1000.0 / 30.0);
-                    var durationMs = media.Duration > 0 ? media.Duration : 0;
-                    if (durationMs > 0 && targetMs >= durationMs)
-                    {
-                        targetMs = Math.Max(0, durationMs - 100);
-                    }
-
-                    player.Time = (long)Math.Max(0, targetMs);
-                    await Task.Delay(350, cancellationToken).ConfigureAwait(false);
-
-                    var snapped = player.TakeSnapshot(0, outputPath, 0, 0);
-                    if (!snapped)
-                    {
-                        return false;
-                    }
-
-                    for (var i = 0; i < 25; i++)
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        if (File.Exists(outputPath) && new FileInfo(outputPath).Length > 0)
-                        {
-                            return true;
-                        }
-
-                        await Task.Delay(100, cancellationToken).ConfigureAwait(false);
-                    }
-
-                    return false;
-                }
-                finally
-                {
-                    player.Playing -= HandlePlaying;
-                    player.EncounteredError -= HandleFailed;
-                    player.Stop();
-                }
+                var extracted = ExtractVideoThumbnailOnSta(mediaPath, frameIndex, outputPath, cancellationToken);
+                tcs.TrySetResult(extracted);
             }
-            catch
+            catch (OperationCanceledException)
+            {
+                tcs.TrySetResult(false);
+            }
+            catch (Exception ex)
+            {
+                AppLog.Warn("ThumbnailService", $"ExtractVideoThumbnailAsync failed on STA thread: {ex.Message}");
+                tcs.TrySetResult(false);
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "SegmentPlayer-ThumbExtract",
+        };
+
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        return await tcs.Task.ConfigureAwait(false);
+    }
+
+    private static bool ExtractVideoThumbnailOnSta(
+        string mediaPath,
+        int frameIndex,
+        string outputPath,
+        CancellationToken cancellationToken)
+    {
+        if (File.Exists(outputPath))
+        {
+            File.Delete(outputPath);
+        }
+
+        var windowParams = new HwndSourceParameters("SegmentPlayerThumbnailHost")
+        {
+            Width = 1,
+            Height = 1,
+            PositionX = -32000,
+            PositionY = -32000,
+            WindowStyle = unchecked((int)0x80000000), // WS_POPUP
+        };
+
+        using var hiddenHost = new HwndSource(windowParams);
+        using var libVlc = new LibVLC("--intf=dummy", "--no-video-title-show");
+        using var media = new Media(libVlc, new Uri(mediaPath));
+        _ = media.Parse(MediaParseOptions.ParseLocal);
+        using var player = new MediaPlayer(libVlc)
+        {
+            Media = media,
+            Mute = true,
+            Hwnd = hiddenHost.Handle,
+        };
+
+        var started = new ManualResetEventSlim(false);
+        var failed = false;
+        void HandlePlaying(object? _, EventArgs __) => started.Set();
+        void HandleFailed(object? _, EventArgs __)
+        {
+            failed = true;
+            started.Set();
+        }
+
+        player.Playing += HandlePlaying;
+        player.EncounteredError += HandleFailed;
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!player.Play())
             {
                 return false;
             }
-        }, cancellationToken).ConfigureAwait(false);
+
+            if (!started.Wait(TimeSpan.FromSeconds(6), cancellationToken) || failed)
+            {
+                return false;
+            }
+
+            var targetMs = frameIndex * (1000.0 / 30.0);
+            var durationMs = media.Duration > 0 ? media.Duration : 0;
+            if (durationMs > 0 && targetMs >= durationMs)
+            {
+                targetMs = Math.Max(0, durationMs - 100);
+            }
+
+            player.Time = (long)Math.Max(0, targetMs);
+            Thread.Sleep(350);
+
+            if (!player.TakeSnapshot(0, outputPath, 0, 0))
+            {
+                return false;
+            }
+
+            for (var i = 0; i < 25; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (File.Exists(outputPath) && new FileInfo(outputPath).Length > 0)
+                {
+                    return true;
+                }
+
+                Thread.Sleep(100);
+            }
+
+            return false;
+        }
+        finally
+        {
+            player.Playing -= HandlePlaying;
+            player.EncounteredError -= HandleFailed;
+            player.Stop();
+            started.Dispose();
+        }
     }
 }

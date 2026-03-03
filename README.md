@@ -14,6 +14,21 @@ dotnet restore
 dotnet run --project PortablePlayer.csproj
 ```
 
+## Portable Packaging
+
+Use the packaging script to build a cleaner folder hierarchy:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\publish-portable.ps1
+```
+
+Default output:
+
+- `publish/SegmentPlayer-win-x64-portable/SegmentPlayer.exe` (root launcher)
+- `publish/SegmentPlayer-win-x64-portable/app/` (player runtime and dependencies)
+- `publish/SegmentPlayer-win-x64-portable/app/config/` (settings)
+- `publish/SegmentPlayer-win-x64-portable/app/media_groups/` (media root)
+
 ## Folder Layout (portable mode)
 
 - `config/settings.json`: application settings

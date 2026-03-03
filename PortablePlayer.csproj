@@ -18,6 +18,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Remove="Launcher\\**\\*.cs" />
+    <None Remove="Launcher\\**\\*" />
+  </ItemGroup>
+
+  <ItemGroup>
     <None Update="config\\settings.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
